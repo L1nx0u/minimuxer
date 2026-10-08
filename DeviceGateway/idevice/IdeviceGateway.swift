@@ -617,10 +617,9 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI {
         if attempt > 1 && client != nil {
             debugLog("[IdeviceGateway] \(serviceName) connected on attempt \(attempt)")
         }
-        guard let connectedClient = client else {
+        guard let client = client else {
             throw IdeviceGatewayError(.serviceError, reason: lastConnectMsg.isEmpty ? "Failed to connect to \(serviceName)" : lastConnectMsg)
         }
-        let client = connectedClient
         defer { cleanup(client) }
 
         return try action(client)
