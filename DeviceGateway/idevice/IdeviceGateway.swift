@@ -569,41 +569,58 @@ public final class IdeviceGateway: BaseDeviceGateway, DeviceGatewayAPI {
             throw IdeviceGatewayError(.connectionFailed, reason: "Temporary pairing file was nil")
         }
 
-        var provider: OpaquePointer? = nil
-        let provErr = try withSockaddr(ip: deviceEndpointIp, port: MinimuxerConstants.lockdowndPort) { sockaddrPtr, _ in
-            sockaddrPtr.withMemoryRebound(to: idevice_sockaddr.self, capacity: 1) { reboundPtr in
-                return idevice_tcp_provider_new(reboundPtr, tempPairingFile, MinimuxerConstants.appName, &provider)
+        // A fresh TCP provider per attempt: the tunnel can drop a single session
+        // (stale mapping, raced teardown) while the device stays reachable.
+        // The action only runs after a successful connect, so retrying the
+        // connect phase can never double-execute anything.
+        var attempt = 0
+        var client: OpaquePointer? = nil
+        var providerToFree: OpaquePointer? = nil
+        var lastConnectMsg = ""
+        while attempt < 2 && client == nil {
+            attempt += 1
+            var provider: OpaquePointer? = nil
+            let provErr = try withSockaddr(ip: deviceEndpointIp, port: MinimuxerConstants.lockdowndPort) { sockaddrPtr, _ in
+                sockaddrPtr.withMemoryRebound(to: idevice_sockaddr.self, capacity: 1) { reboundPtr in
+                    return idevice_tcp_provider_new(reboundPtr, tempPairingFile, MinimuxerConstants.appName, &provider)
+                }
+            }
+            if let provErr = provErr {
+                let msg = self.getErrorMessage(from: provErr)
+                debugLog("[IdeviceGateway] error: Failed to create TCP provider (attempt \(attempt)): \(msg)")
+                defer { safeFreeError(provErr) }
+                lastConnectMsg = "Failed to create TCP provider: \(msg)"
+                continue
+            }
+            guard let freshProvider = provider else {
+                debugLog("[IdeviceGateway] error: TCP Provider was nil (attempt \(attempt))")
+                lastConnectMsg = "TCP Provider was nil"
+                continue
+            }
+            let connectErr = connect(freshProvider, &client)
+            if let connectErr = connectErr {
+                let msg = self.getErrorMessage(from: connectErr)
+                debugLog("[IdeviceGateway] error: \(serviceName) connect failed (attempt \(attempt)): code=\(connectErr.pointee.code), message=\(msg)")
+                defer { safeFreeError(connectErr) }
+                lastConnectMsg = "Failed to connect to \(serviceName), error: (\(msg))"
+                continue
+            }
+            if client != nil {
+                providerToFree = freshProvider
             }
         }
-        if let provErr = provErr {
-            let msg = self.getErrorMessage(from: provErr)
-            debugLog("[IdeviceGateway] error: Failed to create TCP provider: \(msg)")
-            defer { safeFreeError(provErr) }
-            throw IdeviceGatewayError(.connectionFailed, reason: "Failed to create TCP provider: \(msg)")
-        }
-        guard let provider = provider else {
-            debugLog("[IdeviceGateway] error: TCP Provider was nil")
-            throw IdeviceGatewayError(.connectionFailed, reason: "TCP Provider was nil")
-        }
-        var providerToFree: OpaquePointer? = provider
         defer {
             if let ptr = providerToFree {
                 idevice_provider_free(ptr)
             }
         }
-
-        var client: OpaquePointer? = nil
-        let connectErr = connect(provider, &client)
-        if let connectErr = connectErr {
-            providerToFree = nil
-            let msg = self.getErrorMessage(from: connectErr)
-            debugLog("[IdeviceGateway] error: \(serviceName) connect failed: code=\(connectErr.pointee.code), message=\(msg)")
-            defer { safeFreeError(connectErr) }
-            throw IdeviceGatewayError(.serviceError, reason: "Failed to connect to \(serviceName), error: (\(msg))")
+        if attempt > 1 && client != nil {
+            debugLog("[IdeviceGateway] \(serviceName) connected on attempt \(attempt)")
         }
-        guard let client = client else {
-            throw IdeviceGatewayError(.noConnection)
+        guard let connectedClient = client else {
+            throw IdeviceGatewayError(.serviceError, reason: lastConnectMsg.isEmpty ? "Failed to connect to \(serviceName)" : lastConnectMsg)
         }
+        let client = connectedClient
         defer { cleanup(client) }
 
         return try action(client)
